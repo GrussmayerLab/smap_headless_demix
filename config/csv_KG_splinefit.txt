@@ -1,0 +1,7 @@
+frame=frame
+phot=photons
+bg=background
+xnm=xnm
+ynm=ynm
+cam_pixelsize_um=108
+factor=1

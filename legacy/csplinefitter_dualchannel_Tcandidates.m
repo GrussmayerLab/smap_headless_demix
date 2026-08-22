@@ -1,0 +1,630 @@
+%Copyright (c)2017 Ries Lab, European Molecular Biology Laboratory,
+%  Heidelberg.
+%  
+%  This file is part of GPUmleFit_LM Fitter.
+%  
+%  GPUmleFit_LM Fitter is free software: you can redistribute it and/or modify
+%  it under the terms of the GNU General Public License as published by
+%  the Free Software Foundation, either version 3 of the License, or
+%  (at your option) any later version.
+%  
+%  GPUmleFit_LM Fitter is distributed in the hope that it will be useful,
+%  but WITHOUT ANY WARRANTY; without even the implied warranty of
+%  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+%  GNU General Public License for more details.
+%  
+%  You should have received a copy of the GNU General Public License
+%  along with GPUmleFit_LM Fitter.  If not, see <http://www.gnu.org/licenses/>.
+%  
+%  
+%  Additional permission under GNU GPL version 3 section 7
+% 
+% adpated by Moritz Engelhardt, Grussmayer Lab, TU Delft
+% It includes a channel transformation of identified peaks to an ID channel
+% to allow for guaranteed color assignment in SD STORM
+% adds to each loc x_id, y_id, phot_id, bg_id of the
+% corresponding fit in the ID channel
+
+function csplinefitter_dualchannel_Tcandidates(p, T)
+%parameters:
+% p.imagefile: fiename of data (char);
+% p.calfile: filename of calibration data (char);
+% p.offset=ADU offset of data;
+% p.conversion=conversion e-/ADU;
+% p.preview: true if preview mode (fit only current image and display
+% results).
+% p.previewframe=frame to preview;
+% p.peakfilter=filtersize (sigma, Gaussian filter) for peak finding;
+% p.peakcutoff=cutoff for peak finding
+% p.roifit=size of the ROI in pixels
+% p.bidirectional= use bi-directional fitting for 2D data
+% p.mirror=mirror images if bead calibration was taken without EM gain
+% p.status=handle to a GUI object to display the status;
+% p.outputfile=file to write the localization table to;
+% p.outputformat=Format of file;
+% p.pixelsize=pixel size in nm;
+
+% p.loader which loader to use
+% p.mij if loader is fiji: this is the fiji handle
+% p.isscmos scmos camera used
+% p.scmosfile file containgn scmos varmap
+
+fittime=0;
+fitsperblock=300000;%50000;
+imstack=zeros(p.roifit,p.roifit,fitsperblock,'single');
+peakcoordinates=zeros(fitsperblock,3);
+transform = projtform2d(T.transform2Reference{1,2}.T);
+%translation = max(p.currentfileinfo.Width, p.currentfileinfo.Height)/2;
+%translation = T.tinfo.separator(2)/p.pixelsize;
+translation = T.info{1,1}.xrange(1);
+%transform = projtform2d(T.transform2Target{1,2}.T);
+indstack=0;
+resultsind=1;
+scaling_factor = 1000/(p.pixelsize/1000);%(100/p.pixelsize)*1000;
+% bgmode='wavelet'; 
+if contains(p.backgroundmode,'avelet')
+    bgmode=2;
+elseif contains(p.backgroundmode,'aussian')
+     bgmode=1;
+else
+    bgmode=0;
+end
+
+%scmos
+varmap=[];
+if p.isscmos
+    varstack=ones(p.roifit,p.roifit,fitsperblock,'single');
+    [~,~,ext]=fileparts(p.scmosfile);
+    switch ext
+        case '.tif'
+            varmap=imread(p.scmosfile);
+        case '.mat'
+            varmap=load(p.scmosfile);
+            if isstruct(varmap)
+                fn=fieldnames(varmap);
+                varmap=varmap.(fn{1});
+            end
+        otherwise
+            errordlg('could not load variance map. No sCMOS noise model used.')
+            p.isscmos=false;
+            varstack=0;
+    end
+else
+    varstack=0;
+end
+
+if isfield(p, 'roi') && size(varmap,1) ~= 0
+    varmap=varmap(p.roi(2):p.roi(2)+p.roi(4)-1, p.roi(1):p.roi(1)+p.roi(3)-1);
+end 
+
+varmap=varmap*p.conversion^2;
+
+%load calibration
+if exist(p.calfile,'file')
+    cal=load(p.calfile);
+    p.dz=cal.SXY.cspline.dz;  %coordinate system of spline PSF is corner based and in units pixels / planes
+    p.z0=cal.SXY.cspline.z0;
+    p.coeff=cal.SXY.cspline.coeff;
+    if iscell(p.coeff)
+        p.coeff=p.coeff{1};
+    end
+    p.isspline=true;
+else
+%     errordlg('please select 3D calibration file')
+    %warndlg('3D calibration file could not be loaded. Using Gaussian fitter instead.','Using Gaussian fit','replace');
+    fprintf('3D calibration file could not be loaded. Using Gaussian fitter instead.\n');
+    p.isspline=false;
+end
+
+p.dx=floor(p.roifit/2);
+p.status.String=['Open tiff file' ]; drawnow
+
+ switch p.loader
+     case 1
+            reader=mytiffreader(p.imagefile);
+        numframes=reader.info.numberOfFrames;
+     case 2
+        reader=bfGetReader(p.imagefile);
+        numframes=reader.getImageCount;
+     case 3 %fiji
+          ij=p.mij.imagej;
+          ijframes=ij.getFrames;
+          for k=1:length(ijframes)
+            if strcmp(ijframes(k).class,'ij.gui.StackWindow')&&~isempty(ijframes(k).getImagePlus)    
+                reader=ijframes(k).getImagePlus.getStack;
+                break
+            end
+          end
+          if ~exist('reader','var')
+              p.status.String='Error... Check if image is loaded in ImageJ'; drawnow
+              return
+          end
+%         numframes=reader.size;
+          numframes=reader.getSize;
+ end
+
+
+if p.preview
+    frames=min(p.previewframe,numframes);
+else
+    frames=1:numframes;
+end
+
+%loop over frames, do filtering/peakfinding
+hgauss=fspecial('gaussian',max(3,ceil(3*p.peakfilter+1)),p.peakfilter);
+rsize=max(ceil(6*p.peakfilter+1),3);
+hdog=fspecial('gaussian',rsize,p.peakfilter)-fspecial('gaussian',rsize,max(1,2.5*p.peakfilter));
+tshow=tic;
+
+%if ~p.preview
+    % preload image batch to avoid double loading with multiple fovs
+    image_stack = get_image_stack(1:numframes, reader, p);
+    bg_estimate =median(image_stack, 3, 'omitnan');
+    image_stack = image_stack - bg_estimate;
+
+
+
+clear results_all maxgood_all
+% filter fov
+for fov=1:size(p.fov_include, 1)
+    bbox = p.fov_include(fov,:);
+    %reset resultsindex and image coordinate index to no append coordinates across fovs before the
+    %actual merging
+    resultsind=1;
+    indstack=0;
+    for F=frames
+        %if p.preview
+        %    frameimage=getimage(F,reader,p);
+        %else
+            frameimage=image_stack(:,:,F);
+        %end 
+        
+        %whole frame 
+        sim_frame =size(frameimage);
+        imphot_frame =(single(frameimage)-p.offset)*p.conversion;
+
+        % loc channel
+        imphot = imphot_frame(bbox(1):bbox(1)+bbox(3),bbox(2):bbox(2)+bbox(4));
+        sim=size(imphot);
+        %imphot=(single(image)-p.offset)*p.conversion;
+
+        %background determination
+        if 0 %bgmode==3% wavelet
+    %         bg=mywaveletfilter(imphot,3,false,true);
+    %         impf=filter2(hgauss,(imphot)-(bg));
+        elseif bgmode==1
+             impf=filter2(hdog,sqrt(imphot));
+    %          impf=filter2(hdog,(imphot));
+             %impf=filter2(hdog,(imphot- min(imphot(:,1))));
+        elseif bgmode==0
+            impf=filter2(hgauss,(imphot));
+        end
+        maxima=maximumfindcall(impf);
+
+        if p.peakdynamic
+            p.peakcutoff(fov) = getdynamiccutoff(maxima,p.peakdynamicfactor(fov)); 
+        end 
+        
+        % loc channel candidates 
+        indmgood=maxima(:,3)>(p.peakcutoff(fov));
+        indmgood=indmgood&maxima(:,1)>p.dx &maxima(:,1)<=sim(2)-p.dx;
+        indmgood=indmgood&maxima(:,2)>p.dx &maxima(:,2)<=sim(1)-p.dx;
+        maxgood=maxima(indmgood,:);
+
+        
+        
+        if p.preview && size(maxgood,1)>2000
+            p.status.String=('increase cutoff');
+            %return
+        elseif p.preview && size(maxgood,1)==0
+            p.status.String=('No localizations found, decrease cutoff');
+            %return
+        end
+        
+        %cut out images
+        for k=1:size(maxgood,1)
+            if maxgood(k,1)>p.dx && maxgood(k,2)>p.dx && maxgood(k,1)<= sim(2)-p.dx && maxgood(k,2)<=sim(1)-p.dx 
+                indstack=indstack+1;
+                if p.mirror
+                    imstack(:,:,indstack)=imphot(maxgood(k,2)-p.dx:maxgood(k,2)+p.dx,maxgood(k,1)+p.dx:-1:maxgood(k,1)-p.dx);
+                else
+                    imstack(:,:,indstack)=imphot(maxgood(k,2)-p.dx:maxgood(k,2)+p.dx,maxgood(k,1)-p.dx:maxgood(k,1)+p.dx);
+                end
+                if p.isscmos
+                    varstack(:,:,indstack)=varmap(maxgood(k,2)-p.dx:maxgood(k,2)+p.dx,maxgood(k,1)-p.dx:maxgood(k,1)+p.dx);
+                end
+                peakcoordinates(indstack,1:2)=maxgood(k,1:2);
+                peakcoordinates(indstack,3)=F;
+
+                if indstack==fitsperblock
+
+                    % transform peak coordinates to get ID channel peaks
+                    p.status.String=['Transforming candidates to ID channel ...' ]; drawnow
+                    id_peakcoordinates = peakcoordinates;
+                   
+                    % downsample coordinates
+                    id_peakcoordinates(:,1)=id_peakcoordinates(:,1)./scaling_factor;
+                    id_peakcoordinates(:,2)=id_peakcoordinates(:,2)./scaling_factor;
+
+                    [tempx, tempy]=transformPointsForward(transform,id_peakcoordinates(:,1),id_peakcoordinates(:,2));
+                    id_peakcoordinates(:,[1 2])=[tempx, tempy];
+
+                    % upsample coordinates and cast to integer
+                    id_peakcoordinates(:,1)=cast(id_peakcoordinates(:,1).*scaling_factor+translation, "int16");
+                    id_peakcoordinates(:,2)=cast(id_peakcoordinates(:,2).*scaling_factor, "int16");
+                    %id_peakcoordinates(:,1)=cast(id_peakcoordinates(:,1)+translation, "int16");
+                    %id_peakcoordinates(:,2)=cast(id_peakcoordinates(:,2), "int16");
+
+
+                    id_peakcoordinates(:,1)=id_peakcoordinates(:,1)+bbox(2); % remap bbox to whole frame coordinate  +translation +bbox(2)
+                    id_peakcoordinates(:,2)=id_peakcoordinates(:,2)+bbox(1); % remap bbox to whole frame coordinate +bbox(1)
+                    %id_peakcoordinates(:,1)=id_peakcoordinates(:,1); % remap bbox to whole frame coordinate  +translation +bbox(2)
+                    %id_peakcoordinates(:,2)=id_peakcoordinates(:,2); % remap bbox to whole frame coordinate +bbox(1)
+                       
+                       
+                    
+                    %preallocate 
+                    imstack_id = imstack;
+                    varstack_id = varstack;
+                    % go through transformed peakcenters
+                    for l=1:size(id_peakcoordinates,1)
+                        % check if they fit in the frame incl. bbox and
+                        % crop bbox for fitting
+                        if id_peakcoordinates(l,1)>p.dx && id_peakcoordinates(l,2)>p.dx && id_peakcoordinates(l,1)<= sim_frame(2)-p.dx && id_peakcoordinates(l,2)<=sim_frame(1)-p.dx
+                            imstack_id(:,:,l)=imphot_frame(id_peakcoordinates(l,2)-p.dx:id_peakcoordinates(l,2)+p.dx,id_peakcoordinates(l,1)+p.dx:-1:id_peakcoordinates(l,1)-p.dx);
+                        
+                            if p.isscmos
+                                varstack_id(:,:,l)=varmap(id_peakcoordinates(l,2)-p.dx:id_peakcoordinates(l,2)+p.dx,id_peakcoordinates(l,1)-p.dx:id_peakcoordinates(l,1)+p.dx);
+                            end
+
+                        else % if it doesnt fit, just use the original position
+                            imstack_id(:,:,l)=imphot(peakcoordinates(l,2)-p.dx:peakcoordinates(l,2)+p.dx,peakcoordinates(l,1)+p.dx:-1:peakcoordinates(l,1)-p.dx);
+                            id_peakcoordinates(l,:) = peakcoordinates(l,:);
+                            id_peakcoordinates(l,1)=+bbox(2); id_peakcoordinates(l,2)=+bbox(1);
+
+                            if p.isscmos
+                                varstack_id(:,:,l)=varmap(peakcoordinates(l,2)-p.dx:peakcoordinates(l,2)+p.dx,peakcoordinates(l,1)+p.dx:-1:peakcoordinates(l,1)-p.dx);
+                            end
+                        end 
+                    end 
+
+                    %fitting in localisation channel
+                    p.status.String=['Fitting locs...' ]; drawnow
+                    t=tic;
+                    resultsh=fitspline(imstack,peakcoordinates,p,varstack);
+                    fittime=fittime+toc(t);
+
+                    %fitting in ID channel
+                    p.status.String=['Fitting IDs...' ]; drawnow
+                    t=tic;
+                    resultsh_id=fitspline(imstack_id,id_peakcoordinates,p,varstack_id);
+                    %resultsh_id(:,[2 3]) = resultsh_id(:,[2 3])*p.pixelsize(1);
+                    fittime=fittime+toc(t);
+
+                    % append ID fit parameters to loc fit results
+                    if p.isspline
+% 'frame','x_pix','y_pix','z_nm','photons','background',' crlb_x','crlb_y','crlb_z','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm'
+                        resultsh_cat = cat(2, resultsh, resultsh_id(:,[2 3 5 6]));
+                    else
+%'frame','x_pix','y_pix','PSFxnm','PSFynm','photons','background',' crlb_x','crlb_y','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm'
+                        resultsh_cat = cat(2, resultsh, resultsh_id(:,[2 3 6 7]));
+                    end 
+                    
+                    results(resultsind:resultsind+fitsperblock-1,:)=resultsh_cat;
+                    resultsind=resultsind+fitsperblock;
+                    
+                    indstack=0;
+                end
+            end
+        end
+        if toc(tshow)>1
+            tshow=tic;
+            p.status.String=['Loading FOV ' num2str(fov) '\' num2str(size(p.fov_include, 1)) ', frame ' num2str(F) ' of ' num2str(numframes)]; drawnow
+        end
+    end 
+
+    closereader(reader,p);
+    p.status.String=['Fitting last stack...' ]; drawnow
+    t=tic;
+    if indstack<1
+        p.status.String=['No localizations found. Increase cutoff?' ]; drawnow
+
+    end
+    if p.isscmos
+        varh=varstack(:,:,1:indstack);
+    else
+        varh=0;
+    end
+    
+    %try
+        %pre-allocate 
+        varstack_id = varh;
+
+        % ID channel candidate transformation (as you can see above)
+        id_peakcoordinates = peakcoordinates;
+
+        
+        % downsample coordinates
+        id_peakcoordinates(:,1)=id_peakcoordinates(:,1)./scaling_factor;
+        id_peakcoordinates(:,2)=id_peakcoordinates(:,2)./scaling_factor;
+
+        [tempx, tempy]=transformPointsForward(transform,id_peakcoordinates(:,1),id_peakcoordinates(:,2));
+        id_peakcoordinates(:,[1 2])=[tempx, tempy];
+
+        % upsample coordinates and cast to integer
+        id_peakcoordinates(:,1)=cast(id_peakcoordinates(:,1).*scaling_factor+translation, "int16");
+        id_peakcoordinates(:,2)=cast(id_peakcoordinates(:,2).*scaling_factor, "int16");
+        %id_peakcoordinates(:,1)=cast(id_peakcoordinates(:,1)+translation, "int16");
+        %id_peakcoordinates(:,2)=cast(id_peakcoordinates(:,2), "int16");
+
+
+        %id_peakcoordinates(:,1)=id_peakcoordinates(:,1); % remap bbox to whole frame coordinate +bbox(2) +translation
+        %id_peakcoordinates(:,2)=id_peakcoordinates(:,2); % remap bbox to whole frame coordinate +bbox(1)
+         id_peakcoordinates(:,1)=id_peakcoordinates(:,1)+bbox(2); % remap bbox to whole frame coordinate  +translation +bbox(2)
+         id_peakcoordinates(:,2)=id_peakcoordinates(:,2)+bbox(1); % remap bbox to whole frame coordinate +bbox(1)
+                       
+        % go through transformed peakcenters
+        %for l=1:size(id_peakcoordinates,1)
+        for l=1:indstack
+            % check if they fit in the frame incl. bbox and
+            % crop bbox for fitting
+            if id_peakcoordinates(l,1)>p.dx && id_peakcoordinates(l,2)>p.dx && id_peakcoordinates(l,1)<= sim_frame(2)-p.dx && id_peakcoordinates(l,2)<=sim_frame(1)-p.dx
+                imstack_id(:,:,l)=imphot_frame(id_peakcoordinates(l,2)-p.dx:id_peakcoordinates(l,2)+p.dx,id_peakcoordinates(l,1)+p.dx:-1:id_peakcoordinates(l,1)-p.dx);
+                if p.isscmos
+                    varstack_id(:,:,l)=varmap(id_peakcoordinates(l,2)-p.dx:id_peakcoordinates(l,2)+p.dx,id_peakcoordinates(l,1)+p.dx:-1:id_peakcoordinates(l,1)-p.dx);
+                end
+
+            else % if it doesnt fit, just use the original position
+                imstack_id(:,:,l)=imphot(peakcoordinates(l,2)-p.dx:peakcoordinates(l,2)+p.dx,peakcoordinates(l,1)+p.dx:-1:peakcoordinates(l,1)-p.dx);
+                id_peakcoordinates(l,:) = peakcoordinates(l,:);
+                id_peakcoordinates(l,1)=+bbox(2); id_peakcoordinates(l,2)=+bbox(1);
+                if p.isscmos
+                    varstack_id(:,:,l)=varmap(peakcoordinates(l,2)-p.dx:peakcoordinates(l,2)+p.dx,peakcoordinates(l,1)+p.dx:-1:peakcoordinates(l,1)-p.dx);
+                end
+            end 
+        end 
+
+        % fit original loc channel
+        resultsh=fitspline(imstack(:,:,1:indstack),peakcoordinates(1:indstack,:),p,varh); %fit all the rest
+
+        % fit ID channel
+        resultsh_id=fitspline(imstack_id(:,:,1:indstack),id_peakcoordinates(1:indstack,:),p,varh);
+        %resultsh_id(:,[2 3]) = resultsh_id(:,[2 3])*p.pixelsize(1);
+
+
+        % append ID fit parameters to loc fit results
+        if p.isspline
+% 'frame','x_pix','y_pix','z_nm','photons','background',' crlb_x','crlb_y','crlb_z','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm'
+            resultsh_cat = cat(2, resultsh, resultsh_id(:,[2 3 5 6]));
+        else
+%'frame','x_pix','y_pix','PSFxnm','PSFynm','photons','background',' crlb_x','crlb_y','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm'
+            resultsh_cat = cat(2, resultsh, resultsh_id(:,[2 3 6 7]));
+        end 
+
+        results(resultsind:resultsind+indstack-1,:)=resultsh_cat;
+    %catch
+        p.status.String=['Skipping localisation']; drawnow
+    %    results = zeros(1,16,'double');
+    %end 
+    fittime=fittime+toc(t);
+    
+    % add fov starting coordinates to results 
+    results(:,[2, 7]) = results(:,[2, 7])+bbox(2); 
+    results(:,[3, 8]) = results(:,[3, 8])+bbox(1);
+    maxgood(:,1) = maxgood(:,1)+bbox(2);
+    maxgood(:,2) = maxgood(:,2)+bbox(1);
+    %results(:,13) = results(:,13)+bbox(1)*p.pixelsize; 
+    %results(:,14) = results(:,14)+bbox(2)*p.pixelsize;
+
+    if exist('results_all','var')
+        results_all = cat(1,results_all,results);
+        maxgood_all = cat(1,maxgood_all, maxgood);
+    else
+        results_all = results;
+        maxgood_all = maxgood;
+    %results(n_locs:n_locs+resultsind)=results_fov;
+    end
+    clear results
+end
+results = results_all;
+% preview window with peaks, coords and bounding boxes
+if p.preview
+    %figure(201)
+    [~, baseFileName, ~] = fileparts(p.imagefile);
+    if ~isfield(p,'tabgrouphandle')
+        figure('Name',baseFileName)
+    else
+        t = uitab(p.tabgrouphandle,"Title",p.basefilename);
+        axes = uiaxes(t, 'Position', [0, 0, 1000, 1000]);
+    end
+
+    preview_image=getimage(frames,reader,p);
+    preview_image=single(preview_image)-bg_estimate;
+    imphot=(single(preview_image)-p.offset)*p.conversion;
+
+    if bgmode==1
+         impf=filter2(hdog,sqrt(imphot));
+         %impf=filter2(hdog,(imphot));
+         %impf=filter2(hdog,(imphot- min(imphot(:,1))));
+    elseif bgmode==0
+        impf=filter2(hgauss,(imphot));
+    end
+    if ~isfield(p,'tabgrouphandle')
+        imagesc(impf);
+        colormap(hot)
+        hold on
+        plot(maxgood_all(:,1),maxgood_all(:,2),'bo')
+        plot(results_all(:,2),results_all(:,3),'k+') % loc channel
+        plot(results_all(:,end-3),results_all(:,end-2),'r+') % ID channel
+        plot(id_peakcoordinates(:,1),id_peakcoordinates(:,2),'go')
+        for fov=1:size(p.fov_include, 1)
+            bbox = p.fov_include(fov,:);
+            rectangle('Position',[bbox(2) bbox(1) bbox(4) bbox(3)])
+        end 
+        hold off
+    else 
+        imshow(impf, 'Parent', axes);
+        colormap(hot)
+        if any(maxgood_all)
+             hold on
+            plot(maxgood_all(:,1),maxgood_all(:,2),'wo')
+            plot(results_all(:,2),results_all(:,3),'k+') %loc channel
+            % if p.isspline
+            %     plot(results_all(:,16),results_all(:,17),'r+') % ID channel
+            % else 
+            %     plot(results_all(:,17),results_all(:,18),'r+') % ID channel
+            % end 
+            plot(results_all(:,end-3),results_all(:,end-2),'r+') % ID channel
+            for fov=1:size(p.fov_include, 1)
+                bbox = p.fov_include(fov,:);
+                rectangle('Position',[bbox(2) bbox(1) bbox(4) bbox(3)])
+            end 
+            hold off
+        end 
+    end 
+   
+    p.status.String=['Preview done. ' num2str(size(results,1)/fittime,'%3.0f') ' fits/s. ' num2str(size(results,1),'%3.0f') ' localizations.']; drawnow
+else
+    p.status.String=['Fitting done. ' num2str(size(results,1)/fittime,'%3.0f') ' fits/s. ' num2str(size(results,1),'%3.0f') ' localizations. Saving now.']; drawnow
+    results(:,[13,15])=results(:,[2, 7])*p.pixelsize(1);
+    results(:,[14,16])=results(:,[3, 8])*p.pixelsize(end);
+    % convert id pixels to id sr coordinates
+    results(:,[end-2 end-3]) = results(:,[end-2 end-3])*p.pixelsize(1);
+    
+    if p.isspline
+        %resultstable=array2table(results,'VariableNames',{'frame','x_pix','y_pix','z_nm','photons','background',' crlb_x','crlb_y','crlb_z','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm'});
+        resultstable=array2table(results,'VariableNames',{'frame','x_pix','y_pix','z_nm','photons','background',' crlb_x','crlb_y','crlb_z','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm', 'xnm_ID','ynm_ID', 'phot_ID','bkg_ID'});
+    else
+        %resultstable=array2table(results,'VariableNames',{'frame','x_pix','y_pix','PSFxnm','PSFynm','photons','background',' crlb_x','crlb_y','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm'});
+        resultstable=array2table(results,'VariableNames',{'frame','x_pix','y_pix','PSFxnm','PSFynm','photons','background',' crlb_x','crlb_y','crlb_photons','crlb_background','logLikelyhood','xnm','ynm','crlb_xnm','crlb_ynm', 'xnm_ID','ynm_ID', 'phot_ID','bkg_ID'});
+    end
+    % 
+    writenames=true;
+    del=',';
+    writetable(resultstable,p.outputfile,'Delimiter',del,'FileType','text','WriteVariableNames',writenames);
+    p.status.String=['Fitting done. ' num2str(size(results,1)/fittime,'%3.0f') ' fits/s. ' num2str(size(results,1),'%3.0f') ' localizations. Saved.']; drawnow
+end
+end
+
+%% helpers
+function results=fitspline(imstack,peakcoordinates,p,varstack)
+if p.isspline
+    if p.bidirectional
+        fitmode=5;
+        zstart=[-300 300]/p.dz;
+    else
+        fitmode=5;
+        zstart=0;
+    end
+    fitpar=single(p.coeff);
+else
+    if p.bidirectional
+        fitmode=2;
+        zstart=0;
+    else
+        fitmode=4;
+        zstart=0;
+    end
+    fitpar=single(1);
+end
+
+%[Pcspline,CRLB,LL]=mleFit_LM(imstack,fitmode,50,fitpar,varstack,1,zstart);
+[Pcspline,CRLB,LL]=GPUmleFit_LM(imstack,fitmode,50,fitpar,varstack,1,zstart);
+%results=zeros(size(imstack,3),12);
+results=zeros(size(imstack,3),16);
+results(:,1)=peakcoordinates(:,3);
+if  p.mirror
+    results(:,2)=p.dx-Pcspline(:,2)+peakcoordinates(:,1);
+else
+    results(:,2)=Pcspline(:,2)-p.dx+peakcoordinates(:,1);
+    
+end
+
+
+if p.isspline
+    % frame, x,y,z,phot,bg, errx,erry, errz,errphot, errbg,logLikelihood
+results(:,3)=Pcspline(:,1)-p.dx+peakcoordinates(:,2); %x,y in pixels 
+results(:,4)=(Pcspline(:,5)-p.z0)*p.dz;
+results(:,5:6)=Pcspline(:,3:4);
+results(:,7:8)=real(sqrt(CRLB(:,[2 1])));
+results(:,9)=real(sqrt(CRLB(:,5)*p.dz));
+results(:,10:11)=real(sqrt(CRLB(:,3:4)));
+results(:,12)=LL;
+else
+        % frame, x,y,sx,sy,phot,bg, errx,erry,errphot, errbg,logLikelihood
+results(:,3)=Pcspline(:,1)-p.dx+peakcoordinates(:,2); %x,y in pixels 
+results(:,4)=Pcspline(:,5);
+if p.bidirectional
+    results(:,5)=results(:,4);
+else
+    results(:,5)=Pcspline(:,6);
+end
+results(:,6:7)=Pcspline(:,3:4);
+
+results(:,8:9)=real(sqrt(CRLB(:,[2 1])));
+
+results(:,10:11)=real(sqrt(CRLB(:,3:4)));
+results(:,12)=LL;
+end
+
+end
+
+function img=getimage(F,reader,p)
+    switch p.loader
+        case 1
+            img=reader.read(F);
+        case 2
+            img=bfGetPlane(reader,F);
+        case 3        
+            ss=[reader.getWidth reader.getHeight reader.getSize];
+            if F>0&&F<=ss(3)
+                pixel=reader.getPixels(F);
+                img=reshape(pixel,ss(1),ss(2))';
+            else
+                img=[];
+            end
+    end
+
+end
+
+%% preload whole dataset to speed up loading operation
+function imgs = get_image_stack(frames, reader, p)
+imgs = zeros(p.currentfileinfo.Height, p.currentfileinfo.Width, p.currentfileinfo.Frames);
+    for F=frames
+        %imgs = cat(3, imgs, getimage(F,reader,p));
+        imgs(:,:,F)= getimage(F,reader,p);
+    end 
+end     
+
+
+
+
+function closereader(reader,p)
+switch p.loader
+     case 1
+         reader.close;
+    case 2
+    case 3        
+
+end
+
+end
+
+% dynamic definition of peakfinder threshold instead of absolute photons
+% derived from simpleSTORM script
+function co=getdynamiccutoff(maxima,factor)
+ps=[.2 .5 .8];
+if size(maxima,1)<10
+    if isempty(maxima)
+        co=0;
+    else
+        co=mean(maxima(:,3))*factor;
+    end
+else
+    
+qs=myquantilefast(maxima(:,3),ps);
+slope=(qs(3)-qs(1))/(ps(3)-ps(1));
+co=qs(2)+slope*0.5*2*factor;
+%co=qs(2)+slope*0.5*1.5*factor;
+end
+end
